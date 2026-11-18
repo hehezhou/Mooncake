@@ -2,10 +2,13 @@
 
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <type_traits>
 
+#include <async_simple/Future.h>
+#include <async_simple/Promise.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -116,6 +119,12 @@ WrappedMasterService::WrappedMasterService(
         master_service_.setHttpMetadataServer(http_metadata_server);
     } else if (!http_metadata_remote_url.empty()) {
         master_service_.setHttpMetadataRemoteUrl(http_metadata_remote_url);
+    }
+    if (master_service_.PutWaitForSpaceEnabled()) {
+        put_wait_queue_ = std::make_unique<PutWaitQueue>(
+            master_service_.GetSpaceAvailableSignal(),
+            master_service_.PutWaitQueueMaxRequests(),
+            master_service_.PutWaitQueueMaxBytes());
     }
 }
 
@@ -612,6 +621,14 @@ size_t SummarizeBatchPutStart(const std::vector<std::string>& keys,
     return failure_count;
 }
 
+size_t PutRequestBytes(uint64_t slice_length, const ReplicateConfig& config) {
+    const size_t replicas = std::max<size_t>(config.replica_num, 1);
+    if (slice_length > std::numeric_limits<size_t>::max() / replicas) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return slice_length * replicas;
+}
+
 }  // namespace
 
 // Starts the keys of one BatchPutStart in order, across several attempts when
@@ -665,6 +682,42 @@ class WrappedMasterService::BatchPutStartJob {
         return true;
     }
 
+    void FailRemaining(ErrorCode error) {
+        while (results_.size() < keys_.size()) {
+            results_.emplace_back(tl::make_unexpected(error));
+        }
+    }
+
+    // Revokes the keys started so far, so that the next attempt starts over.
+    void Rollback(MasterService& master_service) {
+        for (size_t i = 0; i < results_.size(); ++i) {
+            if (!results_[i]) {
+                continue;
+            }
+            auto revoked = master_service.PutRevoke(
+                client_id_, keys_[i], tenant_id_, ReplicaType::ALL);
+            if (!revoked) {
+                LOG(WARNING) << "Failed to revoke PutStart for key=" << keys_[i]
+                             << " before parking its batch: "
+                             << toString(revoked.error());
+            }
+        }
+        results_.clear();
+        key_config_ = config_;
+    }
+
+    size_t RequestedBytes() const {
+        size_t bytes = 0;
+        for (const auto slice_length : slice_lengths_) {
+            const size_t key_bytes = PutRequestBytes(slice_length, config_);
+            bytes = key_bytes > std::numeric_limits<size_t>::max() - bytes
+                        ? std::numeric_limits<size_t>::max()
+                        : bytes + key_bytes;
+        }
+        return bytes;
+    }
+
+    const std::vector<std::string>& keys() const { return keys_; }
     BatchPutStartResults TakeResults() { return std::move(results_); }
 
    private:
@@ -706,6 +759,134 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     return results;
+}
+
+WrappedMasterService::PutStartResult WrappedMasterService::StartPut(
+    const UUID& client_id, const std::string& key, uint64_t slice_length,
+    const ReplicateConfig& config, const std::string& tenant_id) {
+    return WithWriteTenant(tenant_id, master_service_.IsTenantQuotaEnabled(),
+                           [&](const TenantId& resolved_tenant_id) {
+                               return master_service_.PutStart(
+                                   client_id, key, resolved_tenant_id,
+                                   slice_length, config);
+                           });
+}
+
+void WrappedMasterService::RecordPutStartOutcome(const PutStartResult& result) {
+    if (result) {
+        return;
+    }
+    MasterMetricManager::instance().inc_put_start_failures();
+    if (result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+        MasterMetricManager::instance().inc_put_start_object_already_exists();
+    }
+}
+
+async_simple::Future<WrappedMasterService::PutStartResult>
+WrappedMasterService::PutStartWaitingForSpace(
+    const UUID& client_id, const std::string& key, uint64_t slice_length,
+    const ReplicateConfig& config, const std::string& tenant_id,
+    std::function<bool()> connection_closed) {
+    if (!put_wait_queue_) {
+        return async_simple::makeReadyFuture(
+            PutStart(client_id, key, slice_length, config, tenant_id));
+    }
+    MasterMetricManager::instance().inc_put_start_requests();
+    auto promise = std::make_shared<async_simple::Promise<PutStartResult>>();
+    auto future = promise->getFuture();
+    auto resolve = [promise](PutStartResult result) {
+        RecordPutStartOutcome(result);
+        promise->setValue(std::move(result));
+    };
+
+    PutWaitQueue::Waiter waiter;
+    waiter.bytes = PutRequestBytes(slice_length, config);
+    waiter.attempt = [this, resolve, client_id, key, slice_length, config,
+                      tenant_id,
+                      connection_closed = std::move(connection_closed)]() {
+        if (connection_closed()) {
+            resolve(tl::make_unexpected(ErrorCode::RPC_FAIL));
+            return true;
+        }
+        auto result = StartPut(client_id, key, slice_length, config, tenant_id);
+        if (!result && result.error() == ErrorCode::NO_AVAILABLE_HANDLE &&
+            master_service_.CanPutStartWaitForSpace(slice_length, config)) {
+            return false;
+        }
+        resolve(std::move(result));
+        return true;
+    };
+    waiter.cancel = [resolve] {
+        resolve(tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+    };
+    if (put_wait_queue_->Submit(std::move(waiter)) ==
+        PutWaitQueue::SubmitResult::kRejected) {
+        LOG(WARNING) << "PutStart for key=" << key
+                     << " cannot wait for space: the wait queue is full"
+                     << PUT_NO_SPACE_HELPER_STR;
+        resolve(tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+    }
+    return future;
+}
+
+async_simple::Future<WrappedMasterService::BatchPutStartResult>
+WrappedMasterService::BatchPutStartWaitingForSpace(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
+    const std::string& tenant_id, std::function<bool()> connection_closed) {
+    if (!put_wait_queue_) {
+        return async_simple::makeReadyFuture(
+            BatchPutStart(client_id, keys, slice_lengths, config, tenant_id));
+    }
+    MasterMetricManager::instance().inc_batch_put_start_requests(keys.size());
+    auto resolved_tenant_id = ResolveTenantIdForWrite(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
+    if (auto rejected = RejectBatchPutStart(keys, slice_lengths, config,
+                                            resolved_tenant_id)) {
+        SummarizeBatchPutStart(keys, *rejected);
+        return async_simple::makeReadyFuture(std::move(*rejected));
+    }
+
+    auto job = std::make_shared<BatchPutStartJob>(
+        client_id, keys, slice_lengths, config, resolved_tenant_id.value());
+    auto promise =
+        std::make_shared<async_simple::Promise<BatchPutStartResult>>();
+    auto future = promise->getFuture();
+    auto resolve = [job, promise] {
+        auto results = job->TakeResults();
+        SummarizeBatchPutStart(job->keys(), results);
+        promise->setValue(std::move(results));
+    };
+
+    PutWaitQueue::Waiter waiter;
+    waiter.bytes = job->RequestedBytes();
+    waiter.attempt = [this, job, resolve,
+                      connection_closed = std::move(connection_closed)]() {
+        if (connection_closed()) {
+            job->FailRemaining(ErrorCode::RPC_FAIL);
+            resolve();
+            return true;
+        }
+        if (!job->Advance(master_service_, /*wait_for_space=*/true)) {
+            return false;
+        }
+        resolve();
+        return true;
+    };
+    waiter.release_partial = [this, job] { job->Rollback(master_service_); };
+    waiter.cancel = [job, resolve] {
+        job->FailRemaining(ErrorCode::NO_AVAILABLE_HANDLE);
+        resolve();
+    };
+    if (put_wait_queue_->Submit(std::move(waiter)) ==
+        PutWaitQueue::SubmitResult::kRejected) {
+        LOG(WARNING) << "BatchPutStart of " << keys.size()
+                     << " keys cannot wait for space: the wait queue is full"
+                     << PUT_NO_SPACE_HELPER_STR;
+        job->FailRemaining(ErrorCode::NO_AVAILABLE_HANDLE);
+        resolve();
+    }
+    return future;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(

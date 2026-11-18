@@ -2,13 +2,17 @@
 
 #include <csignal>
 
+#include <functional>
+#include <memory>
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
+#include <async_simple/Future.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
+#include "put_wait_queue.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
@@ -126,6 +130,22 @@ class WrappedMasterService {
     using PutStartResult =
         tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
     using BatchPutStartResult = std::vector<PutStartResult>;
+
+    // PutStart and BatchPutStart for put_wait_for_space. A request that finds
+    // no memory is parked and its future resolves once memory frees up; it
+    // fails with NO_AVAILABLE_HANDLE only when it can never fit or the queue
+    // is full. connection_closed tells whether the caller is still there, so
+    // a parked request whose client left is dropped instead of allocated.
+    // Without put_wait_for_space the futures resolve at once.
+    async_simple::Future<PutStartResult> PutStartWaitingForSpace(
+        const UUID& client_id, const std::string& key, uint64_t slice_length,
+        const ReplicateConfig& config, const std::string& tenant_id,
+        std::function<bool()> connection_closed);
+    async_simple::Future<BatchPutStartResult> BatchPutStartWaitingForSpace(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& slice_lengths,
+        const ReplicateConfig& config, const std::string& tenant_id,
+        std::function<bool()> connection_closed);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
@@ -441,7 +461,16 @@ class WrappedMasterService {
    private:
     class BatchPutStartJob;
 
+    // PutStart without RPC metrics, for each attempt of a parked request.
+    PutStartResult StartPut(const UUID& client_id, const std::string& key,
+                            uint64_t slice_length,
+                            const ReplicateConfig& config,
+                            const std::string& tenant_id);
+    static void RecordPutStartOutcome(const PutStartResult& result);
+
     MasterService master_service_;
+    // Declared after master_service_ so that it shuts down first.
+    std::unique_ptr<PutWaitQueue> put_wait_queue_;
 };
 
 class RpcWorkerPool;
