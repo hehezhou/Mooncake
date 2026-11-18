@@ -177,6 +177,15 @@ class MasterMetricManager {
     void inc_put_start_object_already_exists(int64_t val = 1);
     void inc_put_start_alloc_failures(int64_t val = 1);
     void inc_put_start_partial_allocations(int64_t val = 1);
+
+    // PutStart requests parked by put_wait_for_space
+    void set_put_wait_queue(int64_t requests, int64_t bytes);
+    void inc_put_wait_enqueued(int64_t val = 1);
+    void inc_put_wait_admitted(int64_t val = 1);
+    void inc_put_wait_rejected(int64_t val = 1);
+    void inc_put_wait_drains(int64_t val = 1);
+    void inc_put_wait_attempts(int64_t val = 1);
+    void inc_put_wait_time_us(int64_t val);
     void inc_put_end_requests(int64_t val = 1);
     void inc_put_end_failures(int64_t val = 1);
     void inc_put_revoke_requests(int64_t val = 1);
@@ -669,6 +678,14 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_object_already_exists_;
     ylt::metric::counter_t put_start_alloc_failures_;
     ylt::metric::counter_t put_start_partial_allocations_;
+    ylt::metric::gauge_t put_wait_queue_requests_;
+    ylt::metric::gauge_t put_wait_queue_bytes_;
+    ylt::metric::counter_t put_wait_enqueued_;
+    ylt::metric::counter_t put_wait_admitted_;
+    ylt::metric::counter_t put_wait_rejected_;
+    ylt::metric::counter_t put_wait_drains_;
+    ylt::metric::counter_t put_wait_attempts_;
+    ylt::metric::counter_t put_wait_time_us_;
     ylt::metric::counter_t put_end_requests_;
     ylt::metric::counter_t put_end_failures_;
     ylt::metric::counter_t put_revoke_requests_;

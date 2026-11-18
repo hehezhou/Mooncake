@@ -133,6 +133,28 @@ MasterMetricManager::MasterMetricManager()
           "master_put_start_partial_allocations_total",
           "Total number of PutStart requests that succeeded with fewer "
           "replicas than requested (best-effort degradation)"),
+      put_wait_queue_requests_(
+          "master_put_wait_queue_requests",
+          "PutStart requests currently parked waiting for memory"),
+      put_wait_queue_bytes_(
+          "master_put_wait_queue_bytes",
+          "Bytes requested by PutStart requests currently parked"),
+      put_wait_enqueued_("master_put_wait_enqueued_total",
+                         "Total PutStart requests parked waiting for memory"),
+      put_wait_admitted_(
+          "master_put_wait_admitted_total",
+          "Total parked PutStart requests that left the queue with a result"),
+      put_wait_rejected_(
+          "master_put_wait_rejected_total",
+          "Total PutStart requests refused because the wait queue was full"),
+      put_wait_drains_("master_put_wait_drains_total",
+                       "Total wake-ups of the PutStart wait queue"),
+      put_wait_attempts_(
+          "master_put_wait_attempts_total",
+          "Total allocation attempts made for parked PutStart requests"),
+      put_wait_time_us_(
+          "master_put_wait_time_us_total",
+          "Total microseconds parked PutStart requests spent waiting"),
       put_end_requests_("master_put_end_requests_total",
                         "Total number of PutEnd requests received"),
       put_end_failures_("master_put_end_failures_total",
@@ -636,6 +658,14 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     put_start_object_already_exists_.inc(0);
     put_start_alloc_failures_.inc(0);
     put_start_partial_allocations_.inc(0);
+    put_wait_queue_requests_.update(0);
+    put_wait_queue_bytes_.update(0);
+    put_wait_enqueued_.inc(0);
+    put_wait_admitted_.inc(0);
+    put_wait_rejected_.inc(0);
+    put_wait_drains_.inc(0);
+    put_wait_attempts_.inc(0);
+    put_wait_time_us_.inc(0);
     put_end_requests_.inc(0);
     put_end_failures_.inc(0);
     put_revoke_requests_.inc(0);
@@ -1257,6 +1287,28 @@ void MasterMetricManager::inc_put_start_failures(int64_t val) {
 }
 void MasterMetricManager::inc_put_start_alloc_failures(int64_t val) {
     put_start_alloc_failures_.inc(val);
+}
+void MasterMetricManager::set_put_wait_queue(int64_t requests, int64_t bytes) {
+    put_wait_queue_requests_.update(requests);
+    put_wait_queue_bytes_.update(bytes);
+}
+void MasterMetricManager::inc_put_wait_enqueued(int64_t val) {
+    put_wait_enqueued_.inc(val);
+}
+void MasterMetricManager::inc_put_wait_admitted(int64_t val) {
+    put_wait_admitted_.inc(val);
+}
+void MasterMetricManager::inc_put_wait_rejected(int64_t val) {
+    put_wait_rejected_.inc(val);
+}
+void MasterMetricManager::inc_put_wait_drains(int64_t val) {
+    put_wait_drains_.inc(val);
+}
+void MasterMetricManager::inc_put_wait_attempts(int64_t val) {
+    put_wait_attempts_.inc(val);
+}
+void MasterMetricManager::inc_put_wait_time_us(int64_t val) {
+    put_wait_time_us_.inc(val);
 }
 void MasterMetricManager::inc_put_start_partial_allocations(int64_t val) {
     put_start_partial_allocations_.inc(val);
@@ -2291,6 +2343,14 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_object_already_exists_);
     serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_start_partial_allocations_);
+    serialize_metric(put_wait_queue_requests_);
+    serialize_metric(put_wait_queue_bytes_);
+    serialize_metric(put_wait_enqueued_);
+    serialize_metric(put_wait_admitted_);
+    serialize_metric(put_wait_rejected_);
+    serialize_metric(put_wait_drains_);
+    serialize_metric(put_wait_attempts_);
+    serialize_metric(put_wait_time_us_);
     serialize_metric(put_end_requests_);
     serialize_metric(put_end_failures_);
     serialize_metric(put_revoke_requests_);
