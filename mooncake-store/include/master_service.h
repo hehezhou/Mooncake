@@ -431,6 +431,30 @@ class MasterService {
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    // Whether PutStart requests that find no memory wait for space.
+    [[nodiscard]] bool PutWaitForSpaceEnabled() const {
+        return put_wait_for_space_;
+    }
+    [[nodiscard]] size_t PutWaitQueueMaxRequests() const {
+        return put_wait_queue_max_requests_;
+    }
+    [[nodiscard]] size_t PutWaitQueueMaxBytes() const {
+        return put_wait_queue_max_bytes_;
+    }
+    // Fires whenever memory may have become available.
+    [[nodiscard]] const std::shared_ptr<SpaceAvailableSignal>&
+    GetSpaceAvailableSignal() const {
+        return space_available_signal_;
+    }
+
+    /**
+     * @brief Whether a PutStart that failed with NO_AVAILABLE_HANDLE can
+     * succeed once memory is freed: it asks only for memory replicas, enough
+     * segments are serving, and the slice fits in the largest of them.
+     */
+    [[nodiscard]] bool CanPutStartWaitForSpace(uint64_t slice_length,
+                                               const ReplicateConfig& config);
+
     /**
      * @brief Complete a put operation, replica_type indicates the type of
      * replica to complete (memory or disk)
@@ -2114,6 +2138,12 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
+
+    bool put_wait_for_space_ = false;
+    size_t put_wait_queue_max_requests_ = 0;
+    size_t put_wait_queue_max_bytes_ = 0;
+    const std::shared_ptr<SpaceAvailableSignal> space_available_signal_ =
+        std::make_shared<SpaceAvailableSignal>();
 
     // Task manager
     ClientTaskManager task_manager_;

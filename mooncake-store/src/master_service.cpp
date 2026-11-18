@@ -634,6 +634,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid offloading_queue_limit");
     }
 
+    put_wait_for_space_ = config.put_wait_for_space;
+    put_wait_queue_max_requests_ = config.put_wait_queue_max_requests;
+    put_wait_queue_max_bytes_ = config.put_wait_queue_max_bytes;
+    segment_manager_.SetSpaceAvailableSignal(space_available_signal_);
+    if (put_wait_for_space_) {
+        LOG(INFO) << "PutStart requests that find no memory wait for space"
+                  << ", max_requests=" << put_wait_queue_max_requests_
+                  << ", max_bytes=" << put_wait_queue_max_bytes_;
+    }
+
     if (put_start_release_timeout_sec_ <= put_start_discard_timeout_sec_) {
         LOG(ERROR) << "put_start_release_timeout="
                    << put_start_release_timeout_sec_.count()
@@ -5372,6 +5382,41 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return result;
 }
 
+bool MasterService::CanPutStartWaitForSpace(uint64_t slice_length,
+                                            const ReplicateConfig& config) {
+    if (!put_wait_for_space_ || config.replica_num == 0 ||
+        config.nof_replica_num > 0 || config.dfs_replica_num > 0 ||
+        DetermineReplicaWriteMode(config) ==
+            ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+        return false;
+    }
+    size_t serving_segments = 0;
+    size_t largest_capacity = 0;
+    ScopedAllocatorAccess allocator_access =
+        segment_manager_.getAllocatorAccess();
+    const auto& allocator_manager = allocator_access.getAllocatorManager();
+    for (const auto& name : allocator_manager.getNames()) {
+        const auto* registrations = allocator_manager.getAllocators(name);
+        if (registrations == nullptr) {
+            continue;
+        }
+        bool serving = false;
+        for (const auto& registration : *registrations) {
+            if (!registration->IsAllocatable()) {
+                continue;
+            }
+            serving = true;
+            if (auto allocator = registration->GetAllocator()) {
+                largest_capacity =
+                    std::max(largest_capacity, allocator->capacity());
+            }
+        }
+        serving_segments += serving ? 1 : 0;
+    }
+    return serving_segments >= config.replica_num &&
+           slice_length <= largest_capacity;
+}
+
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
@@ -8440,6 +8485,12 @@ auto MasterService::NotifyOffloadSuccess(
         if (metadata.data_size > 0 && added_new_local_disk_replica) {
             local_ssd_manager_.AdjustUsedBytes(client_id, metadata.data_size);
         }
+    }
+
+    // Offloaded DRAM copies are unpinned now but only an eviction round frees
+    // them; request one while puts are parked for space.
+    if (!tasks.empty() && space_available_signal_->IsArmed()) {
+        need_mem_eviction_ = true;
     }
 
     if (refused_unmounted) {
