@@ -401,6 +401,15 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
     Args&&... args) {
+    return invoke_rpc_with_client_pool_for<ServiceMethod, ReturnType>(
+        client_pool, std::nullopt, std::forward<Args>(args)...);
+}
+
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode>
+MasterClient::invoke_rpc_with_client_pool_for(
+    const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
+    std::optional<std::chrono::milliseconds> request_timeout, Args&&... args) {
     RpcDrainGuard::ScopedCall inflight(rpc_drain_);
     if (!inflight.ok()) {
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -416,8 +425,11 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
+                    // An unset timeout keeps the client's default.
+                    coro_rpc::request_config_t request_config;
+                    request_config.request_timeout_duration = request_timeout;
                     return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                        std::move(request_config), std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
@@ -460,6 +472,15 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    return invoke_batch_rpc_for<ServiceMethod, ResultType>(
+        std::nullopt, input_size, std::forward<Args>(args)...);
+}
+
+template <auto ServiceMethod, typename ResultType, typename... Args>
+std::vector<tl::expected<ResultType, ErrorCode>>
+MasterClient::invoke_batch_rpc_for(
+    std::optional<std::chrono::milliseconds> request_timeout, size_t input_size,
+    Args&&... args) {
     RpcDrainGuard::ScopedCall inflight(rpc_drain_);
     if (!inflight.ok()) {
         return std::vector<tl::expected<ResultType, ErrorCode>>(
@@ -479,8 +500,11 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
+                    // An unset timeout keeps the client's default.
+                    coro_rpc::request_config_t request_config;
+                    request_config.request_timeout_duration = request_timeout;
                     return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                        std::move(request_config), std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
@@ -797,9 +821,11 @@ MasterClient::PutStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::PutStart,
-                             std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, config, tenant_id_.value());
+    auto result =
+        invoke_rpc_with_client_pool_for<&WrappedMasterService::PutStart,
+                                        std::vector<Replica::Descriptor>>(
+            client_accessor_.GetClientPool(), put_start_request_timeout_,
+            client_id_, key, total_slice_length, config, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -822,10 +848,10 @@ MasterClient::BatchPutStart(
         total_slice_lengths.emplace_back(total_slice_length);
     }
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
-                                   std::vector<Replica::Descriptor>>(
-        keys.size(), client_id_, keys, total_slice_lengths, config,
-        tenant_id_.value());
+    auto result = invoke_batch_rpc_for<&WrappedMasterService::BatchPutStart,
+                                       std::vector<Replica::Descriptor>>(
+        put_start_request_timeout_, keys.size(), client_id_, keys,
+        total_slice_lengths, config, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

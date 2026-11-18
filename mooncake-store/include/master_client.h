@@ -819,6 +819,15 @@ class MasterClient {
         const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
         Args&&... args);
 
+    // request_timeout, when set, replaces the pool's request timeout for this
+    // call; a negative one disables it.
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode>
+    invoke_rpc_with_client_pool_for(
+        const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
+        std::optional<std::chrono::milliseconds> request_timeout,
+        Args&&... args);
+
     /**
      * @brief Generic RPC invocation helper for batch operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -831,6 +840,17 @@ class MasterClient {
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
+
+    template <auto ServiceMethod, typename ResultType, typename... Args>
+    [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
+    invoke_batch_rpc_for(
+        std::optional<std::chrono::milliseconds> request_timeout,
+        size_t input_size, Args&&... args);
+
+    // Request timeout for PutStart and BatchPutStart, from
+    // MC_PUT_START_RPC_TIMEOUT_MS; unset keeps the pool's.
+    const std::optional<std::chrono::milliseconds> put_start_request_timeout_ =
+        RpcTimeoutConfig::FromEnvironment().put_start_request_timeout;
 
     RpcClientPool client_accessor_;
     RpcClientPool ha_control_client_accessor_;

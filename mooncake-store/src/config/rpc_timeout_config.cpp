@@ -19,6 +19,11 @@ RpcTimeoutConfig RpcTimeoutConfig::FromEnvironment() {
         config.connect_timeout =
             std::chrono::milliseconds{std::atoll(value->c_str())};
     }
+    if (const auto value =
+            Environ::Read(Variables::MC_PUT_START_RPC_TIMEOUT_MS)) {
+        config.put_start_request_timeout =
+            std::chrono::milliseconds{std::atoll(value->c_str())};
+    }
     return config;
 }
 
