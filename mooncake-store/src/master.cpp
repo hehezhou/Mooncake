@@ -261,6 +261,16 @@ DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_bool(put_wait_for_space, false,
+            "Park PutStart requests that find no free memory until eviction, "
+            "offload or removal frees space, instead of failing them with "
+            "NO_AVAILABLE_HANDLE. Clients should disable the PutStart RPC "
+            "timeout (MC_PUT_START_RPC_TIMEOUT_MS=-1)");
+DEFINE_uint64(put_wait_queue_max_requests, 0,
+              "Maximum number of parked PutStart requests; 0 means unlimited");
+DEFINE_uint64(put_wait_queue_max_bytes, 0,
+              "Maximum total bytes requested by parked PutStart requests; 0 "
+              "means unlimited");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -621,6 +631,20 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    default_config.GetBool("put_wait_for_space",
+                           &master_config.put_wait_for_space,
+                           FLAGS_put_wait_for_space);
+    {
+        uint64_t max_requests = FLAGS_put_wait_queue_max_requests;
+        default_config.GetUInt64("put_wait_queue_max_requests", &max_requests,
+                                 FLAGS_put_wait_queue_max_requests);
+        master_config.put_wait_queue_max_requests =
+            static_cast<size_t>(max_requests);
+        uint64_t max_bytes = FLAGS_put_wait_queue_max_bytes;
+        default_config.GetUInt64("put_wait_queue_max_bytes", &max_bytes,
+                                 FLAGS_put_wait_queue_max_bytes);
+        master_config.put_wait_queue_max_bytes = static_cast<size_t>(max_bytes);
+    }
     {
         uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
         default_config.GetUInt64("offloading_queue_limit",
@@ -981,6 +1005,23 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("put_wait_for_space", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.put_wait_for_space = FLAGS_put_wait_for_space;
+    }
+    if ((google::GetCommandLineFlagInfo("put_wait_queue_max_requests", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.put_wait_queue_max_requests =
+            static_cast<size_t>(FLAGS_put_wait_queue_max_requests);
+    }
+    if ((google::GetCommandLineFlagInfo("put_wait_queue_max_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.put_wait_queue_max_bytes =
+            static_cast<size_t>(FLAGS_put_wait_queue_max_bytes);
     }
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
@@ -1666,6 +1707,11 @@ int main(int argc, char* argv[]) {
         << ", kv_events_backend_id=" << master_config.kv_events_backend_id
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
+        << ", put_wait_for_space=" << master_config.put_wait_for_space
+        << ", put_wait_queue_max_requests="
+        << master_config.put_wait_queue_max_requests
+        << ", put_wait_queue_max_bytes="
+        << master_config.put_wait_queue_max_bytes
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
