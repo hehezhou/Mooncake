@@ -397,6 +397,11 @@ class SegmentManager {
         return usage_tracker_->GetUsage();
     }
 
+    // Must be called before any segment is mounted.
+    void SetSpaceAvailableSignal(std::shared_ptr<SpaceAvailableSignal> signal) {
+        usage_tracker_->SetSpaceAvailableSignal(std::move(signal));
+    }
+
     ErrorCode initializeCxlAllocator(const std::string& cxl_path,
                                      size_t cxl_size);
 
