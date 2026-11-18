@@ -42,6 +42,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     metadata/lease_eviction_index.cpp
     master_service.cpp
     promotion_candidate_tracker.cpp
+    put_wait_queue.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
     master_metric_manager.cpp
