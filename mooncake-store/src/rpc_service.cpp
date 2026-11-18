@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 
@@ -540,72 +541,41 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-WrappedMasterService::BatchPutStart(const UUID& client_id,
-                                    const std::vector<std::string>& keys,
-                                    const std::vector<uint64_t>& slice_lengths,
-                                    const ReplicateConfig& config,
-                                    const std::string& tenant_id) {
-    ScopedVLogTimer timer(1, "BatchPutStart");
-    const size_t total_keys = keys.size();
-    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
-    MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
+namespace {
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
-    results.reserve(keys.size());
-    auto resolved_tenant_id = ResolveTenantIdForWrite(
-        tenant_id, master_service_.IsTenantQuotaEnabled());
+using BatchPutStartResults = WrappedMasterService::BatchPutStartResult;
 
+// The per-key results of a BatchPutStart rejected as a whole, if it is.
+std::optional<BatchPutStartResults> RejectBatchPutStart(
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
+    const tl::expected<TenantId, ErrorCode>& tenant_id) {
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
-        results.assign(keys.size(),
-                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (!config.ValidSessionIds(keys.size())) {
-        results.assign(keys.size(),
-                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (!config.HasValidKeyHints(keys.size())) {
-        LOG(ERROR) << "BatchPutStart: per-key hint count does not match keys";
-        results.assign(keys.size(),
-                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (!resolved_tenant_id) {
-        results.assign(keys.size(),
-                       tl::make_unexpected(resolved_tenant_id.error()));
-    } else if (config.prefer_alloc_in_same_node) {
-        ReplicateConfig new_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            new_config.SetKeyIds(config, i);
-            auto result = master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], new_config);
-            results.emplace_back(result);
-            if ((i == 0) && result.has_value()) {
-                std::string preferred_segment;
-                for (const auto& replica : result.value()) {
-                    if (replica.is_memory_replica()) {
-                        auto handles =
-                            replica.get_memory_descriptor().buffer_descriptor;
-                        if (!handles.transport_endpoint_.empty()) {
-                            preferred_segment = handles.transport_endpoint_;
-                        }
-                    }
-                }
-                if (!preferred_segment.empty()) {
-                    new_config.preferred_segment = preferred_segment;
-                }
-            }
-        }
-    } else {
-        ReplicateConfig key_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            key_config.SetKeyIds(config, i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
-        }
+        return BatchPutStartResults(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     }
+    if (!config.ValidSessionIds(keys.size())) {
+        return BatchPutStartResults(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR) << "BatchPutStart: per-key hint count does not match keys";
+        return BatchPutStartResults(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (!tenant_id) {
+        return BatchPutStartResults(keys.size(),
+                                    tl::make_unexpected(tenant_id.error()));
+    }
+    return std::nullopt;
+}
 
+// Records the metrics and logs of one finished BatchPutStart and returns how
+// many keys failed.
+size_t SummarizeBatchPutStart(const std::vector<std::string>& keys,
+                              const BatchPutStartResults& results) {
     size_t failure_count = 0;
     int64_t already_exists_count = 0;
     int no_available_handle_count = 0;
@@ -632,14 +602,106 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count == results.size()) {
         MasterMetricManager::instance().inc_batch_put_start_failures(
             failure_count);
     } else if (failure_count != 0) {
         MasterMetricManager::instance().inc_batch_put_start_partial_success(
             failure_count);
     }
+    return failure_count;
+}
 
+}  // namespace
+
+// Starts the keys of one BatchPutStart in order, across several attempts when
+// it waits for memory. At the head of the wait queue it keeps the keys already
+// started; parking it behind others rolls them back first.
+class WrappedMasterService::BatchPutStartJob {
+   public:
+    BatchPutStartJob(const UUID& client_id, std::vector<std::string> keys,
+                     std::vector<uint64_t> slice_lengths,
+                     const ReplicateConfig& config, TenantId tenant_id)
+        : client_id_(client_id),
+          keys_(std::move(keys)),
+          slice_lengths_(std::move(slice_lengths)),
+          config_(config),
+          key_config_(config),
+          tenant_id_(std::move(tenant_id)) {
+        results_.reserve(keys_.size());
+    }
+
+    // Starts the remaining keys. With wait_for_space, stops at the first key
+    // that found no memory but fits once memory frees up. Returns whether
+    // every key has its result.
+    bool Advance(MasterService& master_service, bool wait_for_space) {
+        while (results_.size() < keys_.size()) {
+            const size_t i = results_.size();
+            key_config_.SetKeyIds(config_, i);
+            auto result =
+                master_service.PutStart(client_id_, keys_[i], tenant_id_,
+                                        slice_lengths_[i], key_config_);
+            if (wait_for_space && !result &&
+                result.error() == ErrorCode::NO_AVAILABLE_HANDLE &&
+                master_service.CanPutStartWaitForSpace(slice_lengths_[i],
+                                                       key_config_)) {
+                return false;
+            }
+            if (config_.prefer_alloc_in_same_node && i == 0 && result) {
+                // The rest of the batch prefers the first key's segment.
+                for (const auto& replica : result.value()) {
+                    if (replica.is_memory_replica()) {
+                        const auto& handles =
+                            replica.get_memory_descriptor().buffer_descriptor;
+                        if (!handles.transport_endpoint_.empty()) {
+                            key_config_.preferred_segment =
+                                handles.transport_endpoint_;
+                        }
+                    }
+                }
+            }
+            results_.push_back(std::move(result));
+        }
+        return true;
+    }
+
+    BatchPutStartResults TakeResults() { return std::move(results_); }
+
+   private:
+    const UUID client_id_;
+    const std::vector<std::string> keys_;
+    const std::vector<uint64_t> slice_lengths_;
+    const ReplicateConfig config_;
+    ReplicateConfig key_config_;
+    const TenantId tenant_id_;
+    BatchPutStartResults results_;
+};
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+WrappedMasterService::BatchPutStart(const UUID& client_id,
+                                    const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& slice_lengths,
+                                    const ReplicateConfig& config,
+                                    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchPutStart");
+    const size_t total_keys = keys.size();
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
+
+    auto resolved_tenant_id = ResolveTenantIdForWrite(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
+    BatchPutStartResults results;
+    if (auto rejected = RejectBatchPutStart(keys, slice_lengths, config,
+                                            resolved_tenant_id)) {
+        results = std::move(*rejected);
+    } else {
+        BatchPutStartJob job(client_id, keys, slice_lengths, config,
+                             resolved_tenant_id.value());
+        job.Advance(master_service_, /*wait_for_space=*/false);
+        results = job.TakeResults();
+    }
+
+    const size_t failure_count = SummarizeBatchPutStart(keys, results);
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
