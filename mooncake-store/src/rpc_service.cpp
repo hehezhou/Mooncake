@@ -9,6 +9,9 @@
 
 #include <async_simple/Future.h>
 #include <async_simple/Promise.h>
+#include <async_simple/coro/FutureAwaiter.h>
+#include <async_simple/coro/LazyLocalBase.h>
+#include <ylt/coro_io/coro_io.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -887,6 +890,109 @@ WrappedMasterService::BatchPutStartWaitingForSpace(
         resolve();
     }
     return future;
+}
+
+namespace {
+
+// Runs fn on the worker pool, or inline without one.
+template <typename Fn>
+async_simple::coro::Lazy<std::invoke_result_t<Fn>> RunOnWorkers(
+    RpcWorkerPool* worker_pool, Fn fn) {
+    if (worker_pool == nullptr) {
+        co_return fn();
+    }
+    auto result =
+        co_await coro_io::post(std::move(fn), worker_pool->executor());
+    co_return std::move(result).value();
+}
+
+using RpcContextInfo =
+    coro_rpc::context_info_t<coro_rpc::protocol::coro_rpc_protocol>;
+
+// The calling request's context, shared so that the drain thread can still
+// ask whether its client left after the request coroutine is gone.
+async_simple::coro::Lazy<std::shared_ptr<RpcContextInfo>>
+CurrentRpcContextInfo() {
+    auto* lazy_ctx = co_await async_simple::coro::CurrentLazyLocals<
+        coro_rpc::coro_connection::connection_lazy_ctx<
+            coro_rpc::protocol::coro_rpc_protocol>>{};
+    co_return lazy_ctx != nullptr ? lazy_ctx->info_ : nullptr;
+}
+
+std::function<bool()> ConnectionClosedProbe(
+    std::shared_ptr<RpcContextInfo> context) {
+    return [context = std::move(context)] {
+        return context != nullptr && context->has_closed() != 0;
+    };
+}
+
+}  // namespace
+
+async_simple::coro::Lazy<WrappedMasterService::PutStartResult>
+WrappedMasterService::PutStartCoroutine(UUID client_id, std::string key,
+                                        uint64_t slice_length,
+                                        ReplicateConfig config,
+                                        std::string tenant_id) {
+    auto connection_closed =
+        ConnectionClosedProbe(co_await CurrentRpcContextInfo());
+    RpcWorkerPool* worker_pool = put_start_worker_pool_;
+    auto future = co_await RunOnWorkers(worker_pool, [&] {
+        return PutStartWaitingForSpace(client_id, key, slice_length, config,
+                                       tenant_id, connection_closed);
+    });
+    PutStartResult result = co_await std::move(future);
+    if (result && connection_closed()) {
+        // Nobody will finish this put; give its space back now rather than
+        // after the put-start release timeout.
+        auto revoked = co_await RunOnWorkers(worker_pool, [&] {
+            return PutRevoke(client_id, key, ReplicaType::ALL, tenant_id);
+        });
+        if (!revoked) {
+            LOG(WARNING) << "Failed to revoke PutStart for key=" << key
+                         << " after its client left: "
+                         << toString(revoked.error());
+        }
+    }
+    co_return result;
+}
+
+async_simple::coro::Lazy<WrappedMasterService::BatchPutStartResult>
+WrappedMasterService::BatchPutStartCoroutine(
+    UUID client_id, std::vector<std::string> keys,
+    std::vector<uint64_t> slice_lengths, ReplicateConfig config,
+    std::string tenant_id) {
+    auto connection_closed =
+        ConnectionClosedProbe(co_await CurrentRpcContextInfo());
+    RpcWorkerPool* worker_pool = put_start_worker_pool_;
+    auto future = co_await RunOnWorkers(worker_pool, [&] {
+        return BatchPutStartWaitingForSpace(client_id, keys, slice_lengths,
+                                            config, tenant_id,
+                                            connection_closed);
+    });
+    BatchPutStartResult results = co_await std::move(future);
+    if (connection_closed()) {
+        std::vector<std::string> started;
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i]) {
+                started.push_back(keys[i]);
+            }
+        }
+        if (!started.empty()) {
+            auto revoked = co_await RunOnWorkers(worker_pool, [&] {
+                return BatchPutRevoke(client_id, started, ReplicaType::ALL,
+                                      tenant_id);
+            });
+            for (size_t i = 0; i < revoked.size(); ++i) {
+                if (!revoked[i]) {
+                    LOG(WARNING)
+                        << "Failed to revoke PutStart for key=" << started[i]
+                        << " after its client left: "
+                        << toString(revoked[i].error());
+                }
+            }
+        }
+    }
+    co_return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
@@ -2326,8 +2432,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
-        &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
-        &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
+        &WrappedMasterService::PutEnd, &WrappedMasterService::PutRevoke,
         &WrappedMasterService::BatchPutEnd,
         &WrappedMasterService::BatchPutRevoke,
         &WrappedMasterService::UpsertStart, &WrappedMasterService::UpsertEnd,
@@ -2388,6 +2493,20 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::QueryWeightOperation,
         &WrappedMasterService::DeleteWeightRevision>(
         server, wrapped_master_service, worker_pool);
+    if (wrapped_master_service.PutWaitForSpaceEnabled()) {
+        // Same route keys, so clients call them exactly as before.
+        wrapped_master_service.SetPutStartWorkerPool(worker_pool);
+        server.register_handler<&WrappedMasterService::PutStartCoroutine>(
+            &wrapped_master_service,
+            coro_rpc::func_id<&WrappedMasterService::PutStart>());
+        server.register_handler<&WrappedMasterService::BatchPutStartCoroutine>(
+            &wrapped_master_service,
+            coro_rpc::func_id<&WrappedMasterService::BatchPutStart>());
+    } else {
+        RegisterPooledHandlers<&WrappedMasterService::PutStart,
+                               &WrappedMasterService::BatchPutStart>(
+            server, wrapped_master_service, worker_pool);
+    }
     // The prefetch additions stay individual registrations on top of the
     // pool: read-only replica queries (no lease, no promotion-on-hit, no
     // metrics) and the prefetch task RPC. Purely additive for old peers.

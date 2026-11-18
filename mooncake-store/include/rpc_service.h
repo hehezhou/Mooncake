@@ -8,6 +8,7 @@
 #include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <async_simple/Future.h>
+#include <async_simple/coro/Lazy.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -24,6 +25,7 @@ namespace mooncake {
 
 // Forward declaration
 class HttpMetadataServer;
+class RpcWorkerPool;
 class WrappedMasterService {
    public:
     store::GatherReadDirectory gather_directory;
@@ -146,6 +148,24 @@ class WrappedMasterService {
         const std::vector<uint64_t>& slice_lengths,
         const ReplicateConfig& config, const std::string& tenant_id,
         std::function<bool()> connection_closed);
+
+    [[nodiscard]] bool PutWaitForSpaceEnabled() const {
+        return put_wait_queue_ != nullptr;
+    }
+
+    // RPC handlers registered under PutStart and BatchPutStart with
+    // put_wait_for_space. They run each start on worker_pool when given and
+    // suspend, holding no thread, while the request waits for memory.
+    async_simple::coro::Lazy<PutStartResult> PutStartCoroutine(
+        UUID client_id, std::string key, uint64_t slice_length,
+        ReplicateConfig config, std::string tenant_id);
+    async_simple::coro::Lazy<BatchPutStartResult> BatchPutStartCoroutine(
+        UUID client_id, std::vector<std::string> keys,
+        std::vector<uint64_t> slice_lengths, ReplicateConfig config,
+        std::string tenant_id);
+    void SetPutStartWorkerPool(RpcWorkerPool* worker_pool) {
+        put_start_worker_pool_ = worker_pool;
+    }
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
@@ -471,6 +491,7 @@ class WrappedMasterService {
     MasterService master_service_;
     // Declared after master_service_ so that it shuts down first.
     std::unique_ptr<PutWaitQueue> put_wait_queue_;
+    RpcWorkerPool* put_start_worker_pool_ = nullptr;
 };
 
 class RpcWorkerPool;

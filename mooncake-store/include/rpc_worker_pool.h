@@ -87,6 +87,10 @@ class RpcWorkerPool {
         handlers_.push_back(std::move(handler));
     }
 
+    asio::thread_pool::executor_type executor() {
+        return threads_.get_executor();
+    }
+
    private:
     asio::thread_pool threads_;
     std::vector<std::shared_ptr<void>> handlers_;
