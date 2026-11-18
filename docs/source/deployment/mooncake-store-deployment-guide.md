@@ -853,6 +853,22 @@ mooncake_master \
 | `--put_start_discard_timeout_sec` | `30` | Seconds before an uncompleted `PutStart` is discarded |
 | `--put_start_release_timeout_sec` | `600` (10 min) | Seconds before `PutStart`-allocated space is released
 
+### Waiting for Space
+
+By default a `PutStart` that finds no free memory fails at once with `NO_AVAILABLE_HANDLE` (`-200`), even while eviction or SSD offload is still freeing memory in the background. With `--put_wait_for_space=true` the master parks such a request and answers it once eviction, offload or a removal frees enough memory, admitting parked requests in arrival order. A parked request holds no RPC thread, so other RPCs keep being served. A request that can never fit still fails at once: one larger than the largest serving segment, one asking for more replicas than there are serving segments, and one asking for NoF or DFS replicas.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--put_wait_for_space` | `false` | Park `PutStart` and `BatchPutStart` requests that find no free memory until space frees up, instead of failing them with `NO_AVAILABLE_HANDLE` |
+| `--put_wait_queue_max_requests` | `0` (unlimited) | Maximum number of parked requests; a request beyond it fails with `NO_AVAILABLE_HANDLE` |
+| `--put_wait_queue_max_bytes` | `0` (unlimited) | Maximum total bytes (slice size × replica count) requested by parked requests; a request beyond it fails with `NO_AVAILABLE_HANDLE` |
+
+Clients must disable their `PutStart` timeout with `MC_PUT_START_RPC_TIMEOUT_MS=-1` (see [Reference: Client Configuration & Tuning](#reference-client-configuration-tuning)); otherwise a put that waits longer than the RPC timeout, 30 s by default, fails with `RPC_TIMEOUT`.
+
+A parked request finishes only when memory actually frees up. With `--offload_on_evict=true`, eviction frees memory only after a client has written the object to SSD, and the default `bucket_storage_backend` writes only once a bucket fills (256 MB or 500 keys by default). With small workloads, use `file_per_key_storage_backend` or lower the bucket limits (see the [SSD Offload guide](ssd/ssd-offload)), or puts may wait indefinitely.
+
+The `master_put_wait_*` metrics report the number and bytes of parked requests, how many were parked, admitted and refused, and their total waiting time.
+
 ### Eviction & TTLs
 
 | Flag | Default | Description |
@@ -1446,7 +1462,8 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
-| `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
+| `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies to every RPC method; `MC_PUT_START_RPC_TIMEOUT_MS` overrides it for `PutStart` and `BatchPutStart`. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
+| `MC_PUT_START_RPC_TIMEOUT_MS` | unset (`MC_RPC_TIMEOUT_MS` applies) | Per-request deadline (ms) for `PutStart` and `BatchPutStart` only. A negative value disables it, which a master started with `--put_wait_for_space=true` requires, since a put may wait there for memory. `0` makes these calls time out at once |
 | `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` initially; `1000` during HA runtime | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. HA clients retain the normal retry budget during initial discovery and configuration, then use one bounded attempt per runtime reconnect because their monitor and heartbeat loops own the retry schedule. An explicit value overrides both defaults. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
